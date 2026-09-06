@@ -23,7 +23,7 @@ pnpm build
 安装到隔离 Web profile：
 
 ```bash
-dsh plugin --profile web add link:/Users/cheyipai/Desktop/ai/dsh/dsh-inline-chat
+dsh plugin --profile web add link:/Users/username/Desktop/ai/dsh/dsh-inline-chat
 ```
 
 然后重启 `dsh web`。此插件不依赖 `cloudflared`；若安装过程卡在 `cloudflared`，那是 DSH Web profile 的其他依赖安装步骤，不是插件运行代码主动启动的进程。
