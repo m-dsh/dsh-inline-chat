@@ -6,7 +6,7 @@ DSH Web 全局辅助 Chat 插件：在页面右下角提供一个悬浮按钮和
 
 打开右下角悬浮 Chat 后，可以在独立面板中发送消息并查看模型回复。辅助 Chat 使用 DSH 当前可用的模型和账号，但不会进入工作区会话记录。
 
-![dsh-inline-chat 回复效果](docs/images/inline-chat.svg)
+![dsh-inline-chat 回复效果](docs/images/inline-chat.png)
 
 ## 使用方式
 
