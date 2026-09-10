@@ -1,8 +1,40 @@
 import {
   type ConnectionHandle,
-  type ModelCatalogModel,
-  type ModelProviderGroup,
 } from '@deepseek-ai/dsh-client-connection/client'
+
+// DSH 0.1.2-rc.1：模型目录从 connection.api.llm.models 迁移到
+// remote.session.modelCatalog()（由 @deepseek-ai/dsh-api-session-controller 提供）。
+// 这里用足量的结构类型描述返回形状，避免引入新的编译期依赖。
+interface RemoteModelCatalogEffort {
+  id: string
+  name: string
+}
+interface ModelCatalogModel {
+  id: string
+  name: string
+  description?: string
+  reasoning?: { efforts?: RemoteModelCatalogEffort[] }
+}
+type ModelProviderGroup = {
+  id: string
+  name: string
+  models: ModelCatalogModel[]
+}
+interface RemoteModelCatalogResponse {
+  ok: boolean
+  value?: {
+  default?: { provider: string; model: string; reasoningEffort?: string }
+  groups: ModelProviderGroup[]
+  failures?: Array<{ provider?: string; message?: string }>
+  }
+  error?: { code?: string; message?: string }
+}
+interface RemoteSessionHandle {
+  modelCatalog(): Promise<RemoteModelCatalogResponse>
+}
+interface RemoteHandle {
+  session: RemoteSessionHandle
+}
 import {
   INLINE_CHAT_CHANNEL,
   INLINE_CHAT_MODEL_STORAGE_KEY,
@@ -17,10 +49,31 @@ import {
 } from '../core'
 
 export const name = 'dsh-inline-chat-client'
-export const inject = ['connection'] as const
+export const inject = ['connection', 'remote', 'remote.session', 'sessions'] as const
+
+/** 会话 modelSelection projection 的本地结构描述（官方选择器同源语义：current = next ?? 全局默认）。 */
+interface SelectionProjectionSnapshot {
+  next?: InlineChatModelSelection
+}
+interface SessionBindingLike {
+  session?: {
+    projections?: {
+      faceOf(key: string): { getSnapshot(): unknown }
+    }
+  }
+}
+interface SessionsServiceLike {
+  list?: {
+    getSnapshot?(): { current?: unknown }
+    subscribe?(fn: () => void): () => void
+  }
+  binding?(id: unknown): SessionBindingLike | undefined
+}
 
 interface ClientContext {
   connection: ConnectionHandle
+  remote: RemoteHandle
+  sessions: SessionsServiceLike
   on?: (name: 'dispose', callback: () => void) => void
 }
 
@@ -74,6 +127,7 @@ function mount(ctx: ClientContext): { dispose: () => void } {
   let messages = loadMessages()
   let modelGroups: ModelProviderGroup[] = []
   let selection = loadModelSelection()
+  let selectionSource: 'follow' | 'user' = 'follow'
   let modelLoading = true
   let modelNotice = '正在加载模型…'
   let open = false
@@ -105,11 +159,53 @@ function mount(ctx: ClientContext): { dispose: () => void } {
     panel.hidden = !open
     button.setAttribute('aria-expanded', String(open))
     button.title = open ? '关闭辅助 Chat' : '打开辅助 Chat'
+    // 重建前记录思考块展开态，重建后恢复（默认折叠；手动展开的在重绘后保持展开）
+    const openStates = Array.from(list.children).map((el) => {
+      const details = el.querySelector?.('details')
+      return details?.open ?? false
+    })
     list.innerHTML = messages.length
-      ? messages.map(renderMessage).join('')
+      ? messages.map((message, index) => renderMessage(message, openStates[index] ?? false)).join('')
       : emptyStateMarkup()
+    Array.from(list.children).forEach((el, idx) => {
+      if (!openStates[idx]) return
+      const details = el.querySelector?.('details')
+      if (details) details.open = true
+    })
     list.scrollTop = list.scrollHeight
     renderComposer()
+  }
+
+  // 流式期间只就地更新最后一条消息，不重建 <details>，点击展开/收起不会被重绘竞态打断
+  let streamingArticle: HTMLElement | undefined
+  const renderStreaming = () => {
+    const last = messages.at(-1)
+    if (!last || last.role !== 'assistant' || last.error) {
+      streamingArticle = undefined
+      render()
+      return
+    }
+    let article: HTMLElement | undefined = streamingArticle
+    if (!article || !article.isConnected || list.lastElementChild !== article || list.children.length !== messages.length) {
+      render()
+      article = list.lastElementChild instanceof HTMLElement ? list.lastElementChild : undefined
+      streamingArticle = article
+      return
+    }
+    const textEl = article.querySelector('.message-text')
+    if (textEl) textEl.textContent = normalizeAssistantText(last.text)
+    if (last.reasoning !== undefined) {
+      const details = article.querySelector('details')
+      if (!details) {
+        render()
+        article = list.lastElementChild instanceof HTMLElement ? list.lastElementChild : undefined
+        streamingArticle = article
+        return
+      }
+      const reasoningEl = details.querySelector('.reasoning')
+      if (reasoningEl) reasoningEl.textContent = last.reasoning
+    }
+    list.scrollTop = list.scrollHeight
   }
 
   const setOpen = (value: boolean) => {
@@ -204,7 +300,7 @@ function mount(ctx: ClientContext): { dispose: () => void } {
           }
           if (event.type === 'error') throw new Error(event.message)
           saveMessages(messages)
-          render()
+          renderStreaming()
         }
         if (value.done) break
         await sleep(80, requestController.signal)
@@ -223,6 +319,7 @@ function mount(ctx: ClientContext): { dispose: () => void } {
         sending = false
         controller = undefined
         activeRequestId = undefined
+        streamingArticle = undefined
         render()
         input.focus()
       }
@@ -246,6 +343,7 @@ function mount(ctx: ClientContext): { dispose: () => void } {
     if (modelLoading) {
       modelSelect.append(new Option('正在加载模型…', ''))
       setEffortVisible(false)
+      fitSelectWidth(modelSelect)
       renderComposer()
       return
     }
@@ -283,6 +381,7 @@ function mount(ctx: ClientContext): { dispose: () => void } {
         modelSelect.value = key
       }
     }
+    fitSelectWidth(modelSelect)
     renderEffortOptions()
     renderComposer()
   }
@@ -314,42 +413,98 @@ function mount(ctx: ClientContext): { dispose: () => void } {
     effortSelect.append(new Option('推理：默认', ''))
     for (const effort of efforts) effortSelect.append(new Option(`推理：${effort.name}`, effort.id))
     effortSelect.value = selection?.reasoningEffort ?? ''
+    fitSelectWidth(effortSelect, 112)
+  }
+
+  /** 读主界面当前打开会话所选模型（官方选择器同源：会话 modelSelection projection 的 next）。 */
+  const currentSessionSelection = (): InlineChatModelSelection | undefined => {
+    try {
+      const current = (ctx.sessions.list?.getSnapshot?.() as { current?: unknown } | undefined)?.current
+      if (typeof current !== 'string' || current.length === 0) return undefined
+      const projected = ctx.sessions.binding?.(current)?.session?.projections?.faceOf('modelSelection')?.getSnapshot()
+      if (!isRecord(projected)) return undefined
+      return parseModelSelection((projected as SelectionProjectionSnapshot).next)
+    } catch {
+      return undefined
+    }
+  }
+
+  const raced = <T,>(promise: Promise<T>, label: string): Promise<T> => {
+    return new Promise<T>((resolve, reject) => {
+      const timer = window.setTimeout(() => reject(new Error(label)), 10_000)
+      promise.then(
+        (value) => { window.clearTimeout(timer); resolve(value) },
+        (error) => { window.clearTimeout(timer); reject(error) },
+      )
+    })
   }
 
   const loadModels = async () => {
-    const [catalogResult, defaultResult] = await Promise.allSettled([
-      ctx.connection.api.llm.models({}, modelController.signal),
-      ctx.connection.rpc.call(INLINE_CHAT_CHANNEL, 'default-model', {}, modelController.signal),
-    ])
-    if (disposed) return
-
-    let defaultSelection: InlineChatModelSelection | undefined
-    if (defaultResult.status === 'fulfilled' && isRpcSuccess(defaultResult.value) && isRecord(defaultResult.value.value)) {
-      defaultSelection = parseModelSelection((defaultResult.value.value as unknown as InlineChatModelResponse).selection)
-    }
-
-    let catalogLoaded = false
-    if (catalogResult.status === 'fulfilled') {
-      const catalog = catalogResult.value.result
-      if (catalog.ok) {
-        modelGroups = catalog.value.groups
-        catalogLoaded = true
+    try {
+      if (!ctx.remote?.session?.modelCatalog) {
+        throw new Error('ctx.remote 不可用（remotes/gateway bundle 未加载；重启 dsh web 后请硬刷新页面）')
       }
-    }
+      const [catalogResult, defaultResult] = await Promise.allSettled([
+        raced(ctx.remote.session.modelCatalog(), '模型目录请求超过 10 秒未响应'),
+        ctx.connection.rpc.call(INLINE_CHAT_CHANNEL, 'default-model', {}, modelController.signal),
+      ])
+      if (disposed) return
 
-    if (!selection || (catalogLoaded && !findModel(modelGroups, selection))) {
-      selection = defaultSelection ?? firstSelection(modelGroups)
-    }
-    if (selection) saveModelSelection(selection)
+      let defaultSelection: InlineChatModelSelection | undefined
+      if (defaultResult.status === 'fulfilled' && isRpcSuccess(defaultResult.value) && isRecord(defaultResult.value.value)) {
+        defaultSelection = parseModelSelection((defaultResult.value.value as unknown as InlineChatModelResponse).selection)
+      }
 
-    modelLoading = false
-    modelNotice = catalogLoaded
-      ? ''
-      : (selection ? '模型目录加载失败，已使用默认模型' : '没有可用模型，请先在 DSH 中配置')
-    renderModelOptions()
+      let catalogLoaded = false
+      let catalogError = ''
+      if (catalogResult.status === 'fulfilled') {
+        const catalog = catalogResult.value
+        if (catalog?.ok && catalog.value) {
+          modelGroups = catalog.value.groups ?? []
+          catalogLoaded = true
+        } else if (catalog && !catalog.ok) {
+          const failure = catalog.error
+          catalogError = failure ? `${failure.code ?? 'error'}: ${failure.message ?? ''}` : '目录响应失败'
+        } else {
+          catalogError = '目录响应内容无效'
+        }
+      } else {
+        catalogError = catalogResult.reason instanceof Error ? catalogResult.reason.message : String(catalogResult.reason)
+      }
+
+      if (catalogLoaded) {
+        const followTarget = currentSessionSelection()
+        if (followTarget && findModel(modelGroups, followTarget)) {
+          if (selectionSource === 'follow') selection = followTarget
+        } else if (!selection || !findModel(modelGroups, selection)) {
+          selection = defaultSelection ?? firstSelection(modelGroups)
+        }
+      } else if (!selection) {
+        selection = defaultSelection ?? firstSelection(modelGroups)
+      }
+      if (selection) saveModelSelection(selection)
+
+      modelLoading = false
+      modelNotice = catalogLoaded ? '' : (selection ? '' : `没有可用模型：${catalogError}`)
+      renderModelOptions()
+    } catch (error) {
+      if (disposed) return
+      const message = error instanceof Error ? error.message : String(error)
+      console.error('[dsh-inline-chat] 模型目录加载失败:', error)
+      modelLoading = false
+      modelNotice = selection ? '' : `没有可用模型：${message}`
+      renderModelOptions()
+    }
   }
 
-  button.addEventListener('click', () => setOpen(!open))
+  button.addEventListener('click', () => {
+    const next = !open
+    setOpen(next)
+    if (next) {
+      selectionSource = 'follow'
+      if (!sending) void loadModels()
+    }
+  })
   close.addEventListener('click', () => setOpen(false))
   fresh.addEventListener('click', reset)
   form.addEventListener('submit', (event) => {
@@ -368,7 +523,9 @@ function mount(ctx: ClientContext): { dispose: () => void } {
     const next = decodeModelKey(modelSelect.value)
     if (!next) return
     selection = next
+    selectionSource = 'user'
     saveModelSelection(selection)
+    fitSelectWidth(modelSelect)
     renderEffortOptions()
     renderComposer()
   })
@@ -380,10 +537,29 @@ function mount(ctx: ClientContext): { dispose: () => void } {
       ...(effortSelect.value ? { reasoningEffort: effortSelect.value } : {}),
     }
     saveModelSelection(selection)
+    fitSelectWidth(effortSelect, 112)
   })
 
   render()
   void loadModels()
+
+  let refollowTimer: number | undefined
+  const refollowOnSessionChange = () => {
+    window.clearTimeout(refollowTimer)
+    refollowTimer = window.setTimeout(() => {
+      if (disposed || !open || sending) return
+      if (selectionSource !== 'follow') return
+      void loadModels()
+    }, 150)
+  }
+  const unsubscribeSessions = ctx.sessions?.list?.subscribe?.(() => {
+    if (disposed) return
+    refollowOnSessionChange()
+  })
+  ctx.on?.('dispose', () => {
+    window.clearTimeout(refollowTimer)
+    unsubscribeSessions?.()
+  })
 
   const dispose = () => {
     disposed = true
@@ -469,15 +645,34 @@ function decodeModelKey(value: string): InlineChatModelSelection | undefined {
   }
 }
 
-function renderMessage(message: StoredMessage): string {
+let measureContext: CanvasRenderingContext2D | undefined
+
+/** 让 select 宽度贴合当前选中项文本（原生 select 会按最宽 option 撑开）。 */
+function fitSelectWidth(el: HTMLSelectElement, maxWidth = 178): void {
+  if (typeof document === 'undefined') return
+  const context = measureContext ?? (measureContext = document.createElement('canvas').getContext('2d') ?? undefined)
+  if (!context) return
+  const style = getComputedStyle(el)
+  context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+  const label = el.selectedOptions[0]?.textContent ?? ''
+  if (!label) {
+    el.style.width = ''
+    return
+  }
+  const reserved = 8 + 24 + 2 // CSS 左 padding 8px + 右侧箭头区 24px + 取整余量
+  const width = Math.min(Math.ceil(context.measureText(label).width) + reserved, maxWidth)
+  el.style.width = `${width}px`
+}
+
+function renderMessage(message: StoredMessage, open = false): string {
   const errorClass = message.error ? ' message-error' : ''
   const reasoning = message.reasoning
-    ? `<details><summary>思考过程</summary><div class="reasoning">${escapeHtml(message.reasoning)}</div></details>`
+    ? `<details${open ? ' open' : ''}><summary>思考过程<span class="chev">▸</span></summary><div class="reasoning">${escapeHtml(message.reasoning)}</div></details>`
     : ''
   if (message.role === 'user') {
     return `<article class="message user${errorClass}"><div class="message-text">${escapeHtml(message.text)}</div></article>`
   }
-  return `<article class="message assistant${errorClass}"><div class="assistant-mark" aria-hidden="true">D</div><div class="assistant-body"><div class="message-text">${escapeHtml(normalizeAssistantText(message.text))}</div>${reasoning}</div></article>`
+  return `<article class="message assistant${errorClass}"><div class="assistant-mark" aria-hidden="true">D</div><div class="assistant-body">${reasoning}<div class="message-text">${escapeHtml(normalizeAssistantText(message.text))}</div></div></article>`
 }
 
 function normalizeAssistantText(value: string): string {
@@ -554,9 +749,12 @@ button, textarea, select { font: inherit; }
 .message-text { font-size: 13px; line-height: 1.65; }
 .message-error .assistant-mark { background: var(--ic-danger); }
 .message-error .message-text { color: var(--ic-danger); }
-details { margin-top: 10px; color: var(--ic-muted); font-size: 11px; }
-summary { width: fit-content; cursor: pointer; user-select: none; }
-.reasoning { margin-top: 7px; padding-left: 10px; border-left: 2px solid var(--ic-border); color: var(--ic-muted); line-height: 1.55; white-space: pre-wrap; }
+details { color: var(--ic-muted); font-size: 11px; margin-bottom: 5px; }
+summary { width: fit-content; cursor: pointer; user-select: none; list-style: none; }
+summary::-webkit-details-marker { display: none; }
+.chev { display: inline-block; margin-left: 6px; font-size: 10px; color: var(--ic-muted); opacity: 0.75; transition: transform 0.15s ease; }
+details[open] > summary .chev { transform: rotate(90deg); }
+.reasoning { margin-bottom: 7px; padding-left: 10px; border-left: 2px solid var(--ic-border); color: var(--ic-muted); line-height: 1.55; white-space: pre-wrap; }
 .empty { height: 100%; max-width: 290px; margin: auto; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .empty-mark { width: 38px; height: 38px; margin-bottom: 14px; border-radius: 12px; font-size: 15px; box-shadow: 0 5px 16px rgba(0,0,0,.14); }
 .empty-title { margin-bottom: 7px; font-size: 16px; font-weight: 650; letter-spacing: -.02em; }

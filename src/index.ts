@@ -86,7 +86,7 @@ export function apply(ctx: HostContext): void {
     }
 
     return failure('未知的辅助 Chat 操作')
-  }, { authority: 'trusted-host' })
+  })
 }
 
 async function runGeneration(ctx: HostContext, job: PendingRequest): Promise<void> {

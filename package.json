@@ -27,17 +27,21 @@
     "./package.json": "./package.json"
   },
   "dsh": {
-    "engines": { "dsh": ">=0.1.1-rc.2" },
+    "engines": { "dsh": ">=0.1.2-rc.1" },
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
       "platform": "web",
-      "inject": ["@deepseek-ai/dsh-client-connection"]
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller"
+      ]
     }
   },
   "dependencies": {
-    "@deepseek-ai/dsh-agent-default-model": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-connection": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-llm": "^0.1.1-rc.2"
+    "@deepseek-ai/dsh-agent-default-model": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-client-connection": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
